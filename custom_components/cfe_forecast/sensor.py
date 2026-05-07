@@ -85,6 +85,8 @@ async def async_setup_entry(
         CFEProyeccionSensor(coordinator, config_entry),
         CFEConsumoNetoBimestreSensor(coordinator, config_entry),
         CFEBolsaEnergiaSensor(coordinator, config_entry),
+        CFEBaselineImportSensor(coordinator, config_entry),
+        CFEBaselineExportSensor(coordinator, config_entry),
     ]
 
     async_add_entities(entities)
@@ -573,6 +575,8 @@ class CFECoordinator(DataUpdateCoordinator):
         await self.async_save_state()
 
         resultado = {
+            "import_baseline": self._import_baseline,
+            "export_baseline": self._export_baseline,
             "consumo_neto_kwh": round(consumo_neto, 3),
             "bolsa_total_kwh": self._total_bolsa(),
             "costo_sin_iva": round(costo_sin_iva, 2),
@@ -756,4 +760,74 @@ class CFEBolsaEnergiaSensor(CFEBaseSensor):
             "kwh_proximos_a_vencer": data.get("bolsa_proxima_vencer_kwh"),
             "fecha_proximo_vencimiento": data.get("bolsa_proxima_vencer_fecha"),
             "meses_vigencia": BOLSA_EXPIRATION_MONTHS,
+        }
+
+
+# =============================================================================
+# SENSORES DE LECTURA BASE (CERO VIRTUAL)
+# =============================================================================
+
+class CFEBaselineImportSensor(CFEBaseSensor):
+    """
+    Lectura del medidor de importacion al inicio del bimestre.
+
+    Este es el 'cero virtual' de importacion. El consumo neto del bimestre
+    se calcula como: lectura_actual - este_valor.
+    Se actualiza automaticamente al detectar un nuevo bimestre.
+    """
+
+    _attr_name = "Lectura Base de Importacion"
+    _attr_icon = "mdi:transmission-tower-import"
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+
+    def __init__(self, coordinator, config_entry):
+        super().__init__(coordinator, config_entry, "baseline_import")
+
+    @property
+    def native_value(self) -> float | None:
+        if self.coordinator.data:
+            return self.coordinator.data.get("import_baseline")
+        return None
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        data = self.coordinator.data or {}
+        return {
+            "bimestre_inicio": data.get("bimestre_inicio"),
+            "descripcion": "Lectura del medidor al inicio del bimestre (punto cero de importacion).",
+        }
+
+
+class CFEBaselineExportSensor(CFEBaseSensor):
+    """
+    Lectura del medidor de exportacion al inicio del bimestre.
+
+    Este es el 'cero virtual' de exportacion. El excedente neto del bimestre
+    se calcula como: lectura_actual - este_valor.
+    Se actualiza automaticamente al detectar un nuevo bimestre.
+    """
+
+    _attr_name = "Lectura Base de Exportacion"
+    _attr_icon = "mdi:transmission-tower-export"
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+
+    def __init__(self, coordinator, config_entry):
+        super().__init__(coordinator, config_entry, "baseline_export")
+
+    @property
+    def native_value(self) -> float | None:
+        if self.coordinator.data:
+            return self.coordinator.data.get("export_baseline")
+        return None
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        data = self.coordinator.data or {}
+        return {
+            "bimestre_inicio": data.get("bimestre_inicio"),
+            "descripcion": "Lectura del medidor al inicio del bimestre (punto cero de exportacion).",
         }
