@@ -103,8 +103,10 @@ class CFECoordinator(DataUpdateCoordinator):
     Responsabilidades:
       1. Leer los sensores de HA (import / export) cada N minutos.
       2. Calcular el delta respecto al inicio del bimestre (cero virtual).
-      3. Actualizar la bolsa de energía: un depósito por dia, usando upsert
-         en lugar de append ciego para evitar acumulacion erronea.
+      3. Mantener un acumulador DIARIO que evita duplicación en la bolsa:
+         - Calcula delta diario (no acumulado del bimestre)
+         - Al cambiar de día, traspa el acumulador anterior a la bolsa
+         - Esto previene sumar dos veces lo mismo
       4. Calcular el costo progresivo segun escalones CFE.
       5. Persistir el estado en el Store de HA para sobrevivir reinicios.
     """
@@ -136,6 +138,15 @@ class CFECoordinator(DataUpdateCoordinator):
         self._last_import_reading: float | None = None
         self._last_export_reading: float | None = None
         self._last_reading_date: date | None = None
+
+        # Acumulador diario: almacena el excedente (negativo) o deficit (positivo) del día actual.
+        # Se usa para evitar duplicación al depositar en bolsa.
+        # Cuando cambia el día, el acumulador se deposita en la bolsa y se reinicia.
+        self._acumulador_diario: float = 0.0
+        
+        # Lecturas de inicio del día (se actualizan al cambiar de día)
+        self._import_inicio_dia: float = 0.0
+        self._export_inicio_dia: float = 0.0
 
         self.data: dict[str, Any] = self._empty_data()
 
@@ -190,6 +201,10 @@ class CFECoordinator(DataUpdateCoordinator):
         if last_date_str:
             self._last_reading_date = date.fromisoformat(last_date_str)
 
+        self._acumulador_diario = state.get("acumulador_diario", 0.0)
+        self._import_inicio_dia = state.get("import_inicio_dia", 0.0)
+        self._export_inicio_dia = state.get("export_inicio_dia", 0.0)
+
     async def async_save_state(self) -> None:
         stored = await self._store.async_load() or {}
 
@@ -206,6 +221,9 @@ class CFECoordinator(DataUpdateCoordinator):
             "last_reading_date": (
                 self._last_reading_date.isoformat() if self._last_reading_date else None
             ),
+            "acumulador_diario": self._acumulador_diario,
+            "import_inicio_dia": self._import_inicio_dia,
+            "export_inicio_dia": self._export_inicio_dia,
         }
 
         await self._store.async_save(stored)
@@ -286,38 +304,37 @@ class CFECoordinator(DataUpdateCoordinator):
         if antes > despues:
             _LOGGER.info("[CFE] Se expiraron %.2f kWh de la bolsa.", antes - despues)
 
-    def _upsert_deposito_hoy(self, kwh: float) -> None:
+    def _traspasar_acumulador_a_bolsa(self) -> None:
         """
-        Crea o actualiza el deposito del dia de hoy.
-
-        Garantiza que solo exista UN deposito por fecha. Llamar esto
-        multiples veces en el mismo dia simplemente actualiza el valor,
-        no acumula depositos adicionales. Esto corrige el bug que causaba
-        valores excesivos en la bolsa.
+        Traspasa el acumulador diario a la bolsa de energía como un depósito del día.
+        
+        Esto ocurre cuando:
+        - El acumulador es negativo (hay excedente): se deposita en bolsa.
+        - Se reinicia el acumulador para el nuevo día.
         """
-        if kwh <= 0:
-            return
-
-        hoy_str = date.today().isoformat()
-
-        for deposito in self._bolsa_depositos:
-            if deposito["date"] == hoy_str:
-                deposito["kwh"] = round(kwh, 3)
-                _LOGGER.debug("[CFE] Deposito de hoy actualizado a %.3f kWh.", kwh)
-                return
-
-        self._bolsa_depositos.append({"kwh": round(kwh, 3), "date": hoy_str})
-        _LOGGER.debug("[CFE] Nuevo deposito creado: %.3f kWh (%s).", kwh, hoy_str)
-
-    def _eliminar_deposito_hoy(self) -> None:
-        """
-        Elimina el deposito de hoy si el consumo neto paso a ser positivo.
-        Evita dejar un deposito fantasma del excedente anterior del mismo dia.
-        """
-        hoy_str = date.today().isoformat()
-        self._bolsa_depositos = [
-            d for d in self._bolsa_depositos if d["date"] != hoy_str
-        ]
+        if self._acumulador_diario < -0.001:  # Solo si hay excedente
+            excedente = abs(self._acumulador_diario)
+            hoy_str = date.today().isoformat()
+            
+            # Buscar si ya existe un depósito de hoy y actualizarlo
+            for deposito in self._bolsa_depositos:
+                if deposito["date"] == hoy_str:
+                    deposito["kwh"] = round(excedente, 3)
+                    _LOGGER.debug(
+                        "[CFE] Acumulador diario (%.3f kWh) trasvasado a bolsa de hoy.",
+                        excedente,
+                    )
+                    self._acumulador_diario = 0.0
+                    return
+            
+            # Si no existe, crear uno nuevo
+            self._bolsa_depositos.append({"kwh": round(excedente, 3), "date": hoy_str})
+            _LOGGER.debug(
+                "[CFE] Nuevo depósito en bolsa por acumulador diario: %.3f kWh.",
+                excedente,
+            )
+        
+        self._acumulador_diario = 0.0
 
     def _consumir_de_bolsa(self, kwh_necesarios: float) -> float:
         """
@@ -443,11 +460,13 @@ class CFECoordinator(DataUpdateCoordinator):
           2. Detectar nuevo bimestre: reiniciar estado y capturar baseline.
           3. Primera captura de baseline si no se hizo todavia.
           4. Calcular delta bimestral (consumo real desde el inicio del ciclo).
-          5. Actualizar la bolsa del dia (upsert, no append ciego).
-          6. Calcular costo progresivo.
-          7. Generar proyeccion al final del bimestre.
-          8. Calcular alertas con mensajes descriptivos.
-          9. Guardar estado.
+          5. Detectar cambio de día y traspasar acumulador a bolsa.
+          6. Calcular delta diario y acumular en acumulador diario.
+          7. Gestionar consumo de bolsa basado en acumulador diario (evita duplicación).
+          8. Calcular costo progresivo.
+          9. Generar proyeccion al final del bimestre.
+          10. Calcular alertas con mensajes descriptivos.
+          11. Guardar estado.
         """
         cfg = {**self.config_entry.data, **self.config_entry.options}
 
@@ -507,48 +526,79 @@ class CFECoordinator(DataUpdateCoordinator):
                 })
                 _LOGGER.info("[CFE] Bolsa inicial de %.3f kWh anadida.", inicial)
 
-        # 4. Calcular delta bimestral
+        # 4. Calcular delta bimestral (para mostrar consumo neto del bimestre)
         delta_import = max(0.0, import_lectura - self._import_baseline)
         delta_export = max(0.0, export_lectura - self._export_baseline)
-        consumo_neto = delta_import - delta_export
+        consumo_neto_bimestre = delta_import - delta_export
 
-        # 5. Gestionar bolsa del dia (UPSERT)
-        if consumo_neto < 0:
-            # Excedente de exportacion: depositar/actualizar bolsa de hoy
-            self._upsert_deposito_hoy(abs(consumo_neto))
-            kwh_a_cobrar = 0.0
+        # 5. Detectar cambio de día y gestionar acumulador diario
+        # Si cambió el día, traspasar el acumulador del día anterior a la bolsa.
+        if self._last_reading_date is not None and self._last_reading_date < hoy:
+            self._traspasar_acumulador_a_bolsa()
+            # Reiniciar las lecturas de inicio del nuevo día
+            self._import_inicio_dia = import_lectura
+            self._export_inicio_dia = export_lectura
+            _LOGGER.debug(
+                "[CFE] Nuevo día detectado. Inicio del día: import=%.3f, export=%.3f",
+                self._import_inicio_dia,
+                self._export_inicio_dia,
+            )
+        elif self._import_inicio_dia == 0.0 and self._export_inicio_dia == 0.0:
+            # Primera ejecución del día
+            self._import_inicio_dia = import_lectura
+            self._export_inicio_dia = export_lectura
+            _LOGGER.debug(
+                "[CFE] Primera ejecución del día. Inicio: import=%.3f, export=%.3f",
+                self._import_inicio_dia,
+                self._export_inicio_dia,
+            )
+
+        # 6. Calcular delta diario (desde inicio del día hasta ahora)
+        delta_import_hoy = max(0.0, import_lectura - self._import_inicio_dia)
+        delta_export_hoy = max(0.0, export_lectura - self._export_inicio_dia)
+        delta_neto_hoy = delta_import_hoy - delta_export_hoy
+
+        # 7. Acumular el delta diario al acumulador
+        self._acumulador_diario += delta_neto_hoy
+        self._acumulador_diario = round(self._acumulador_diario, 3)
+
+        # 8. Gestionar el consumo de la bolsa basado en el acumulador diario
+        # Si el acumulador es positivo (consumo), consumir de la bolsa primero
+        if self._acumulador_diario > 0.001:
+            kwh_a_cobrar = self._consumir_de_bolsa(self._acumulador_diario)
+            self._acumulador_diario = 0.0  # El consumo se procesó
+            _LOGGER.debug(
+                "[CFE] Acumulador diario consumido. kWh a cobrar: %.3f", kwh_a_cobrar
+            )
         else:
-            # Consumo positivo: eliminar deposito de hoy si existia,
-            # luego cubrir el consumo con la bolsa de dias anteriores.
-            self._eliminar_deposito_hoy()
-            kwh_a_cobrar = self._consumir_de_bolsa(consumo_neto)
+            kwh_a_cobrar = 0.0
 
         self._last_import_reading = import_lectura
         self._last_export_reading = export_lectura
         self._last_reading_date = hoy
 
-        # 6. Calcular costo progresivo
+        # 9. Calcular costo progresivo
         iva = float(cfg.get(CONF_IVA, DEFAULT_IVA))
         cargo_fijo = float(cfg.get(CONF_FIXED_CHARGE, DEFAULT_FIXED_CHARGE))
 
         costo_sin_iva = self._calcular_costo_progresivo(kwh_a_cobrar)
         costo_con_iva = round((costo_sin_iva + cargo_fijo) * (1 + iva), 2)
 
-        # 7. Proyeccion al final del bimestre
+        # 10. Proyeccion al final del bimestre
         inicio_bimestre = self._bimestre_start or hoy
         fin_bimestre = self._calcular_fin_bimestre(inicio_bimestre)
         dias_totales = max(1, (fin_bimestre - inicio_bimestre).days)
         dias_transcurridos = max(1, (hoy - inicio_bimestre).days)
         dias_restantes = max(0, (fin_bimestre - hoy).days)
 
-        consumo_diario_promedio = consumo_neto / dias_transcurridos
+        consumo_diario_promedio = consumo_neto_bimestre / dias_transcurridos
         consumo_proyectado = consumo_diario_promedio * dias_totales
         bolsa_disponible = self._total_bolsa()
         kwh_proyectado_a_cobrar = max(0.0, consumo_proyectado - bolsa_disponible)
         costo_proyectado_sin_iva = self._calcular_costo_progresivo(kwh_proyectado_a_cobrar)
         costo_proyectado = round((costo_proyectado_sin_iva + cargo_fijo) * (1 + iva), 2)
 
-        # 8. Calcular alertas
+        # 11. Calcular alertas
         kwh_por_vencer, fecha_vencimiento = self._info_proxima_expiracion()
 
         alerta_expiracion = False
@@ -563,7 +613,7 @@ class CFECoordinator(DataUpdateCoordinator):
                     f"(en {dias_para_vencer} dias). Consúmalos antes de perderlos."
                 )
 
-        en_riesgo_dac = self._verificar_riesgo_dac(consumo_neto, dias_transcurridos)
+        en_riesgo_dac = self._verificar_riesgo_dac(consumo_neto_bimestre, dias_transcurridos)
         riesgo_dac_mensaje = (
             "Consumo proyectado supera el limite DAC. "
             "Considere reducir el consumo para evitar tarifas mas altas."
@@ -571,13 +621,13 @@ class CFECoordinator(DataUpdateCoordinator):
             else "Consumo dentro de limites normales."
         )
 
-        # 9. Guardar estado
+        # 12. Guardar estado
         await self.async_save_state()
 
         resultado = {
             "import_baseline": self._import_baseline,
             "export_baseline": self._export_baseline,
-            "consumo_neto_kwh": round(consumo_neto, 3),
+            "consumo_neto_kwh": round(consumo_neto_bimestre, 3),
             "bolsa_total_kwh": self._total_bolsa(),
             "costo_sin_iva": round(costo_sin_iva, 2),
             "costo_con_iva": costo_con_iva,

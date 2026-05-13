@@ -1,7 +1,7 @@
 {
   "domain": "cfe_forecast",
   "name": "CFE Forecast MX",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "documentation": "https://github.com/miplatas/cfe_forecast_mx",
   "issue_tracker": "https://github.com/miplatas/cfe_forecast_mx/issues",
   "dependencies": [],
