@@ -84,6 +84,9 @@ async def async_setup_entry(
         CFECostoActualSensor(coordinator, config_entry),
         CFEProyeccionSensor(coordinator, config_entry),
         CFEConsumoNetoBimestreSensor(coordinator, config_entry),
+        CFEImportadoDiarioSensor(coordinator, config_entry),
+        CFEExportadoDiarioSensor(coordinator, config_entry),
+        CFENetoDiarioSensor(coordinator, config_entry),
         CFEBolsaEnergiaSensor(coordinator, config_entry),
         CFEBaselineImportSensor(coordinator, config_entry),
         CFEBaselineExportSensor(coordinator, config_entry),
@@ -153,6 +156,9 @@ class CFECoordinator(DataUpdateCoordinator):
     def _empty_data(self) -> dict[str, Any]:
         return {
             "consumo_neto_kwh": 0.0,
+            "importado_diario_kwh": 0.0,
+            "exportado_diario_kwh": 0.0,
+            "neto_diario_kwh": 0.0,
             "bolsa_total_kwh": 0.0,
             "costo_sin_iva": 0.0,
             "costo_con_iva": 0.0,
@@ -558,8 +564,10 @@ class CFECoordinator(DataUpdateCoordinator):
         delta_export_hoy = max(0.0, export_lectura - self._export_inicio_dia)
         delta_neto_hoy = delta_import_hoy - delta_export_hoy
 
-        # 7. Acumular el delta diario al acumulador
-        self._acumulador_diario += delta_neto_hoy
+        # 7. Actualizar acumulador diario con el neto acumulado del día.
+        # delta_neto_hoy ya representa el acumulado desde el inicio del día,
+        # por lo que se asigna directo para evitar sobreacumulación por ciclo.
+        self._acumulador_diario = delta_neto_hoy
         self._acumulador_diario = round(self._acumulador_diario, 3)
 
         # 8. Gestionar el consumo de la bolsa basado en el acumulador diario
@@ -628,6 +636,9 @@ class CFECoordinator(DataUpdateCoordinator):
             "import_baseline": self._import_baseline,
             "export_baseline": self._export_baseline,
             "consumo_neto_kwh": round(consumo_neto_bimestre, 3),
+            "importado_diario_kwh": round(delta_import_hoy, 3),
+            "exportado_diario_kwh": round(delta_export_hoy, 3),
+            "neto_diario_kwh": round(delta_neto_hoy, 3),
             "bolsa_total_kwh": self._total_bolsa(),
             "costo_sin_iva": round(costo_sin_iva, 2),
             "costo_con_iva": costo_con_iva,
@@ -778,6 +789,63 @@ class CFEConsumoNetoBimestreSensor(CFEBaseSensor):
             "bimestre_inicio": data.get("bimestre_inicio"),
             "bimestre_fin": data.get("bimestre_fin"),
         }
+
+
+class CFEImportadoDiarioSensor(CFEBaseSensor):
+    """Energia importada en el día actual en kWh."""
+
+    _attr_name = "Importado Diario"
+    _attr_icon = "mdi:transmission-tower-import"
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+
+    def __init__(self, coordinator, config_entry):
+        super().__init__(coordinator, config_entry, "importado_diario")
+
+    @property
+    def native_value(self) -> float | None:
+        if self.coordinator.data:
+            return self.coordinator.data.get("importado_diario_kwh")
+        return None
+
+
+class CFEExportadoDiarioSensor(CFEBaseSensor):
+    """Energia exportada en el día actual en kWh."""
+
+    _attr_name = "Exportado Diario"
+    _attr_icon = "mdi:transmission-tower-export"
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+
+    def __init__(self, coordinator, config_entry):
+        super().__init__(coordinator, config_entry, "exportado_diario")
+
+    @property
+    def native_value(self) -> float | None:
+        if self.coordinator.data:
+            return self.coordinator.data.get("exportado_diario_kwh")
+        return None
+
+
+class CFENetoDiarioSensor(CFEBaseSensor):
+    """Consumo neto del día (importado - exportado) en kWh."""
+
+    _attr_name = "Neto Diario"
+    _attr_icon = "mdi:home-lightning-bolt"
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+
+    def __init__(self, coordinator, config_entry):
+        super().__init__(coordinator, config_entry, "neto_diario")
+
+    @property
+    def native_value(self) -> float | None:
+        if self.coordinator.data:
+            return self.coordinator.data.get("neto_diario_kwh")
+        return None
 
 
 class CFEBolsaEnergiaSensor(CFEBaseSensor):
