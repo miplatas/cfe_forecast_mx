@@ -142,14 +142,20 @@ class CFECoordinator(DataUpdateCoordinator):
         self._last_export_reading: float | None = None
         self._last_reading_date: date | None = None
 
-        # Acumulador diario: almacena el excedente (negativo) o deficit (positivo) del día actual.
-        # Se usa para evitar duplicación al depositar en bolsa.
-        # Cuando cambia el día, el acumulador se deposita en la bolsa y se reinicia.
+        # Acumulador diario: solo informativo para sensores diarios.
         self._acumulador_diario: float = 0.0
+
+        # Acumulador mensual: neto acumulado del mes actual (import - export).
+        # Este valor se liquida en bolsa solo cuando cambia el mes.
+        self._acumulador_mensual: float = 0.0
         
         # Lecturas de inicio del día (se actualizan al cambiar de día)
         self._import_inicio_dia: float = 0.0
         self._export_inicio_dia: float = 0.0
+
+        # Lecturas de inicio del mes (se actualizan al cambiar de mes)
+        self._import_inicio_mes: float = 0.0
+        self._export_inicio_mes: float = 0.0
 
         self.data: dict[str, Any] = self._empty_data()
 
@@ -208,8 +214,11 @@ class CFECoordinator(DataUpdateCoordinator):
             self._last_reading_date = date.fromisoformat(last_date_str)
 
         self._acumulador_diario = state.get("acumulador_diario", 0.0)
+        self._acumulador_mensual = state.get("acumulador_mensual", 0.0)
         self._import_inicio_dia = state.get("import_inicio_dia", 0.0)
         self._export_inicio_dia = state.get("export_inicio_dia", 0.0)
+        self._import_inicio_mes = state.get("import_inicio_mes", 0.0)
+        self._export_inicio_mes = state.get("export_inicio_mes", 0.0)
 
     async def async_save_state(self) -> None:
         stored = await self._store.async_load() or {}
@@ -228,8 +237,11 @@ class CFECoordinator(DataUpdateCoordinator):
                 self._last_reading_date.isoformat() if self._last_reading_date else None
             ),
             "acumulador_diario": self._acumulador_diario,
+            "acumulador_mensual": self._acumulador_mensual,
             "import_inicio_dia": self._import_inicio_dia,
             "export_inicio_dia": self._export_inicio_dia,
+            "import_inicio_mes": self._import_inicio_mes,
+            "export_inicio_mes": self._export_inicio_mes,
         }
 
         await self._store.async_save(stored)
@@ -310,53 +322,59 @@ class CFECoordinator(DataUpdateCoordinator):
         if antes > despues:
             _LOGGER.info("[CFE] Se expiraron %.2f kWh de la bolsa.", antes - despues)
 
-    def _traspasar_acumulador_a_bolsa(self) -> None:
+    def _liquidar_mes_en_bolsa(self, fecha_cierre_mes: date) -> None:
         """
-        Traspasa el acumulador diario a la bolsa de energía como un depósito del día.
-        
-        Esto ocurre cuando:
-        - El acumulador es negativo (hay excedente): se deposita en bolsa.
-        - Se reinicia el acumulador para el nuevo día.
+        Liquida el neto del mes cerrado contra la bolsa.
+
+        Reglas:
+          - Neto mensual negativo (excedente): se deposita en bolsa.
+          - Neto mensual positivo (consumo): se consume de bolsa en FIFO.
+        Se ejecuta una sola vez al detectar cambio de mes.
         """
-        if self._acumulador_diario < -0.001:  # Solo si hay excedente
-            excedente = abs(self._acumulador_diario)
-            hoy_str = date.today().isoformat()
-            
-            # Buscar si ya existe un depósito de hoy y actualizarlo
+        if self._acumulador_mensual < -0.001:
+            excedente = abs(self._acumulador_mensual)
+            fecha_str = fecha_cierre_mes.isoformat()
+
+            # Buscar si ya existe un depósito para ese cierre y actualizarlo
             for deposito in self._bolsa_depositos:
-                if deposito["date"] == hoy_str:
+                if deposito["date"] == fecha_str:
                     deposito["kwh"] = round(excedente, 3)
                     _LOGGER.debug(
-                        "[CFE] Acumulador diario (%.3f kWh) trasvasado a bolsa de hoy.",
+                        "[CFE] Excedente mensual (%.3f kWh) abonado en bolsa (fecha %s).",
                         excedente,
+                        fecha_str,
                     )
-                    self._acumulador_diario = 0.0
+                    self._acumulador_mensual = 0.0
                     return
-            
+
             # Si no existe, crear uno nuevo
-            self._bolsa_depositos.append({"kwh": round(excedente, 3), "date": hoy_str})
+            self._bolsa_depositos.append({"kwh": round(excedente, 3), "date": fecha_str})
             _LOGGER.debug(
-                "[CFE] Nuevo depósito en bolsa por acumulador diario: %.3f kWh.",
+                "[CFE] Nuevo depósito en bolsa por cierre mensual: %.3f kWh (fecha %s).",
                 excedente,
+                fecha_str,
             )
-        
-        self._acumulador_diario = 0.0
+
+        elif self._acumulador_mensual > 0.001:
+            remanente = self._consumir_de_bolsa(self._acumulador_mensual)
+            _LOGGER.debug(
+                "[CFE] Cierre mensual con consumo neto %.3f kWh; remanente sin cubrir %.3f kWh.",
+                self._acumulador_mensual,
+                remanente,
+            )
+
+        self._acumulador_mensual = 0.0
 
     def _consumir_de_bolsa(self, kwh_necesarios: float) -> float:
         """
         Consume kWh de la bolsa usando logica FIFO (mas antiguos primero).
-        No toca el deposito del dia actual.
 
         Returns:
             kWh que no pudieron cubrirse con la bolsa (a cobrar por CFE).
         """
         remanente = kwh_necesarios
-        hoy_str = date.today().isoformat()
 
-        depositos_aplicables = sorted(
-            [d for d in self._bolsa_depositos if d["date"] != hoy_str],
-            key=lambda d: d["date"],
-        )
+        depositos_aplicables = sorted(self._bolsa_depositos, key=lambda d: d["date"])
 
         for deposito in depositos_aplicables:
             if remanente <= 0:
@@ -365,10 +383,7 @@ class CFECoordinator(DataUpdateCoordinator):
             deposito["kwh"] = round(deposito["kwh"] - consumir, 3)
             remanente = round(remanente - consumir, 3)
 
-        self._bolsa_depositos = [
-            d for d in self._bolsa_depositos
-            if d["kwh"] > 0.001 or d["date"] == hoy_str
-        ]
+        self._bolsa_depositos = [d for d in self._bolsa_depositos if d["kwh"] > 0.001]
 
         return max(0.0, remanente)
 
@@ -466,9 +481,9 @@ class CFECoordinator(DataUpdateCoordinator):
           2. Detectar nuevo bimestre: reiniciar estado y capturar baseline.
           3. Primera captura de baseline si no se hizo todavia.
           4. Calcular delta bimestral (consumo real desde el inicio del ciclo).
-          5. Detectar cambio de día y traspasar acumulador a bolsa.
-          6. Calcular delta diario y acumular en acumulador diario.
-          7. Gestionar consumo de bolsa basado en acumulador diario (evita duplicación).
+          5. Detectar cambio de mes y liquidar neto mensual en bolsa.
+          6. Detectar cambio de día y reiniciar lecturas diarias.
+          7. Calcular deltas diario/mensual.
           8. Calcular costo progresivo.
           9. Generar proyeccion al final del bimestre.
           10. Calcular alertas con mensajes descriptivos.
@@ -537,11 +552,33 @@ class CFECoordinator(DataUpdateCoordinator):
         delta_export = max(0.0, export_lectura - self._export_baseline)
         consumo_neto_bimestre = delta_import - delta_export
 
-        # 5. Detectar cambio de día y gestionar acumulador diario
-        # Si cambió el día, traspasar el acumulador del día anterior a la bolsa.
+        # 5. Detectar cambio de mes y liquidar bolsa una sola vez por mes
+        if (
+            self._last_reading_date is not None
+            and (
+                self._last_reading_date.year != hoy.year
+                or self._last_reading_date.month != hoy.month
+            )
+        ):
+            self._liquidar_mes_en_bolsa(self._last_reading_date)
+            self._import_inicio_mes = import_lectura
+            self._export_inicio_mes = export_lectura
+            _LOGGER.info(
+                "[CFE] Cambio de mes detectado. Nuevo inicio mensual: import=%.3f, export=%.3f",
+                self._import_inicio_mes,
+                self._export_inicio_mes,
+            )
+        elif self._import_inicio_mes == 0.0 and self._export_inicio_mes == 0.0:
+            self._import_inicio_mes = import_lectura
+            self._export_inicio_mes = export_lectura
+            _LOGGER.debug(
+                "[CFE] Primera captura de inicio mensual: import=%.3f, export=%.3f",
+                self._import_inicio_mes,
+                self._export_inicio_mes,
+            )
+
+        # 6. Detectar cambio de día y reiniciar lecturas diarias
         if self._last_reading_date is not None and self._last_reading_date < hoy:
-            self._traspasar_acumulador_a_bolsa()
-            # Reiniciar las lecturas de inicio del nuevo día
             self._import_inicio_dia = import_lectura
             self._export_inicio_dia = export_lectura
             _LOGGER.debug(
@@ -559,27 +596,21 @@ class CFECoordinator(DataUpdateCoordinator):
                 self._export_inicio_dia,
             )
 
-        # 6. Calcular delta diario (desde inicio del día hasta ahora)
+        # 7. Calcular deltas diarios y mensual
         delta_import_hoy = max(0.0, import_lectura - self._import_inicio_dia)
         delta_export_hoy = max(0.0, export_lectura - self._export_inicio_dia)
         delta_neto_hoy = delta_import_hoy - delta_export_hoy
+        delta_import_mes = max(0.0, import_lectura - self._import_inicio_mes)
+        delta_export_mes = max(0.0, export_lectura - self._export_inicio_mes)
+        delta_neto_mes = delta_import_mes - delta_export_mes
 
-        # 7. Actualizar acumulador diario con el neto acumulado del día.
-        # delta_neto_hoy ya representa el acumulado desde el inicio del día,
-        # por lo que se asigna directo para evitar sobreacumulación por ciclo.
+        # El acumulador diario se usa solo para exposición de estado diario.
         self._acumulador_diario = delta_neto_hoy
         self._acumulador_diario = round(self._acumulador_diario, 3)
+        self._acumulador_mensual = round(delta_neto_mes, 3)
 
-        # 8. Gestionar el consumo de la bolsa basado en el acumulador diario
-        # Si el acumulador es positivo (consumo), consumir de la bolsa primero
-        if self._acumulador_diario > 0.001:
-            kwh_a_cobrar = self._consumir_de_bolsa(self._acumulador_diario)
-            self._acumulador_diario = 0.0  # El consumo se procesó
-            _LOGGER.debug(
-                "[CFE] Acumulador diario consumido. kWh a cobrar: %.3f", kwh_a_cobrar
-            )
-        else:
-            kwh_a_cobrar = 0.0
+        # 8. Calcular kWh facturables del bimestre menos bolsa disponible.
+        kwh_a_cobrar = max(0.0, consumo_neto_bimestre - self._total_bolsa())
 
         self._last_import_reading = import_lectura
         self._last_export_reading = export_lectura
